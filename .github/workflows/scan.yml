@@ -1,42 +1,67 @@
+
 name: Scan public eMAG sitemaps
+
 on:
   workflow_dispatch:
   schedule:
     - cron: '23 3 * * *'
+
 permissions:
-  contents: write
+  contents: read
   pages: write
   id-token: write
+
 concurrency:
   group: emag-scan
   cancel-in-progress: false
+
 jobs:
   scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install -r requirements.txt
-      - run: python scanner.py
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scanner
+        run: python scanner.py
         env:
           MAX_PRODUCTS: '150'
           MAX_SITEMAPS: '40'
           REQUEST_DELAY: '5'
-      - name: Commit scan results
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/results.json docs/results.csv
-          git diff --cached --quiet || (git commit -m "Update product scan" && git push)
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+
+      - name: Save scan reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: emag-scan-reports
+          path: |
+            docs/results.json
+            docs/results.csv
+            docs/diagnostics.json
+          if-no-files-found: warn
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload website
+        uses: actions/upload-pages-artifact@v3
         with:
           path: docs
-      - uses: actions/deploy-pages@v4
+
+      - name: Publish website
         id: deployment
+        uses: actions/deploy-pages@v4
+        
