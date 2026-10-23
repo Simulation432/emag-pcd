@@ -1,141 +1,446 @@
+
 #!/usr/bin/env python3
-"""Cautious eMAG public sitemap scanner; no login, proxies or bot bypass."""
-import os,re,json,time,random,csv,io,datetime,urllib.parse,urllib.robotparser,xml.etree.ElementTree as ET
+"""eMAG scanner with sitemap access diagnostics."""
+
+import os
+import re
+import json
+import time
+import csv
+import gzip
+import datetime
+import urllib.parse
+import urllib.robotparser
+import xml.etree.ElementTree as ET
 from collections import deque
+
 import requests
 from bs4 import BeautifulSoup
 
-BASE='https://www.emag.bg/'
-UA='EmagPublicPriceResearch/1.0 (respectful sitemap reader)'
-MAX_PRODUCTS=int(os.getenv('MAX_PRODUCTS','150'))
-MAX_SITEMAPS=int(os.getenv('MAX_SITEMAPS','40'))
-DELAY=float(os.getenv('REQUEST_DELAY','5'))
-TIMEOUT=18
-MIN_DIFF=50
-DATA='docs/results.json'
-SESSION=requests.Session(); SESSION.headers.update({'User-Agent':UA,'Accept-Language':'bg-BG,bg;q=0.9'})
-state={'status':'starting','checked':0,'discovered_urls':0,'errors':[],'updated_utc':None,'items':[]}
+HOSTS = (
+    "https://www.emag.bg",
+    "https://emag.bg"
+)
 
-def request(url):
+ALLOWED_HOSTS = {"emag.bg", "www.emag.bg"}
+UA = "EmagPublicPriceResearch/1.1"
+
+MAX_PRODUCTS = max(0, int(os.getenv("MAX_PRODUCTS", "150")))
+MAX_SITEMAPS = max(1, int(os.getenv("MAX_SITEMAPS", "40")))
+DELAY = max(2.0, float(os.getenv("REQUEST_DELAY", "5")))
+
+MIN_DIFF = 50.0
+MIN_PRICE = 0.0
+TIMEOUT = 18
+
+session = requests.Session()
+session.headers.update({
+    "User-Agent": UA,
+    "Accept-Language": "bg-BG,bg;q=0.9"
+})
+
+state = {
+    "status": "starting",
+    "checked": 0,
+    "discovered_urls": 0,
+    "errors": [],
+    "diagnostics": [],
+    "updated_utc": None,
+    "items": []
+}
+
+
+def record(url, status, message="", final_url=None):
+    state["diagnostics"].append({
+        "url": url,
+        "http_status": status,
+        "message": str(message)[:240],
+        "final_url": final_url or url
+    })
+
+
+def get(url):
     time.sleep(DELAY)
-    r=SESSION.get(url,timeout=TIMEOUT,allow_redirects=True)
-    if r.status_code in (401,403,429,503,511): raise PermissionError(f'HTTP {r.status_code} за {url}')
-    r.raise_for_status()
-    if urllib.parse.urlparse(r.url).hostname not in ('emag.bg','www.emag.bg'): raise ValueError('Извън emag.bg')
-    return r
+    response = session.get(
+        url,
+        timeout=TIMEOUT,
+        allow_redirects=True
+    )
+    if urllib.parse.urlsplit(response.url).hostname not in ALLOWED_HOSTS:
+        raise ValueError("Redirect outside emag.bg")
+    return response
 
-def amount(s):
-    s=re.sub(r'[^\d,.]','',str(s))
-    if not s: return None
-    if ',' in s and '.' in s:
-        s=s.replace('.','').replace(',','.') if s.rfind(',')>s.rfind('.') else s.replace(',','')
-    elif ',' in s: s=s.replace(',','.')
-    try:return float(s)
-    except ValueError:return None
 
-def eur(value,unit):
-    if value is None:return None
-    unit=unit.lower()
-    return round(value/1.95583,2) if ('лв' in unit or 'bgn' in unit) else round(value,2)
+def robots_for(host):
+    url = host + "/robots.txt"
+    try:
+        response = get(url)
+        record(url, response.status_code, "robots.txt", response.url)
 
-def extract(html,url):
-    soup=BeautifulSoup(html,'html.parser')
-    for tag in soup(['script','style','noscript']):
-        if tag.name!='script' or tag.get('type','').lower()!='application/ld+json':tag.decompose()
-    txt=soup.get_text(' ',strip=True)
-    # Require explicit PCD shown on the rendered HTML; never substitute crossed-out/list prices.
-    m=re.search(r'ПЦД\s*:?\s*([\d\s\u00a0.,]+?)\s*(€|EUR|лв\.?|BGN)',txt,re.I)
-    if not m:return None
-    pcd=eur(amount(m.group(1)),m.group(2))
-    if not pcd or pcd<=0:return None
-    current=None
-    # Prefer structured offer price, but only if currency identified.
-    for script in soup.find_all('script',type='application/ld+json'):
-        try: data=json.loads(script.string or script.get_text())
-        except (ValueError,TypeError):continue
-        stack=[data]
+        if response.status_code != 200:
+            state["errors"].append(
+                f"robots.txt {host}: HTTP {response.status_code}"
+            )
+            return None, []
+
+        rules = urllib.robotparser.RobotFileParser()
+        rules.parse(response.text.splitlines())
+
+        if not rules.can_fetch(UA, host + "/"):
+            state["errors"].append(
+                f"robots.txt does not allow crawling: {host}"
+            )
+            return None, []
+
+        urls = re.findall(
+            r"^\s*Sitemap:\s*(\S+)",
+            response.text,
+            re.I | re.M
+        )
+
+        urls += [
+            host + "/sitemap.xml",
+            host + "/available_products-index.xml"
+        ]
+
+        return rules, list(dict.fromkeys(urls))
+
+    except (requests.RequestException, ValueError) as exc:
+        record(url, None, str(exc)[:200])
+        state["errors"].append(f"robots failed: {host}")
+        return None, []
+
+
+def amount(text):
+    text = re.sub(r"[^\d,.]", "", str(text))
+    if not text:
+        return None
+
+    if "," in text and "." in text:
+        if text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "").replace(",", ".")
+        else:
+            text = text.replace(",", "")
+    elif "," in text:
+        text = text.replace(",", ".")
+
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def eur(value, currency):
+    if value is None:
+        return None
+
+    if currency.lower().startswith(("лв", "bgn")):
+        return round(value / 1.95583, 2)
+
+    return round(value, 2)
+
+
+def extract(html, url):
+    soup = BeautifulSoup(html, "html.parser")
+    visible = BeautifulSoup(html, "html.parser")
+
+    for node in visible(["script", "style", "noscript"]):
+        node.decompose()
+
+    text = visible.get_text(" ", strip=True)
+
+    match = re.search(
+        r"ПЦД\s*:?\s*([\d\s\u00a0.,]+?)\s*(€|EUR|лв\.?|BGN)",
+        text,
+        re.I
+    )
+
+    if not match:
+        return None
+
+    pcd = eur(amount(match.group(1)), match.group(2))
+    if pcd is None or pcd <= 0:
+        return None
+
+    current = None
+
+    for node in soup.find_all("script", type="application/ld+json"):
+        try:
+            payload = json.loads(node.string or node.get_text())
+        except (ValueError, TypeError):
+            continue
+
+        stack = [payload]
+
         while stack:
-            obj=stack.pop()
-            if isinstance(obj,list):stack.extend(obj);continue
-            if not isinstance(obj,dict):continue
-            stack.extend(v for v in obj.values() if isinstance(v,(dict,list)))
-            if 'price' in obj and obj.get('priceCurrency') in ('EUR','BGN'):
-                value=eur(amount(obj['price']),obj['priceCurrency'])
-                if value is not None and value>=0 and (current is None or value<current):current=value
+            obj = stack.pop()
+
+            if isinstance(obj, list):
+                stack.extend(obj)
+
+            elif isinstance(obj, dict):
+                stack.extend(
+                    v for v in obj.values()
+                    if isinstance(v, (dict, list))
+                )
+
+                if obj.get("priceCurrency") in ("EUR", "BGN") and "price" in obj:
+                    val = eur(
+                        amount(obj["price"]),
+                        obj["priceCurrency"]
+                    )
+
+                    if (
+                        val is not None
+                        and val >= MIN_PRICE
+                        and (current is None or val < current)
+                    ):
+                        current = val
+
     if current is None:
-        # visible selling price cues; skip if none (do not guess from other numbers)
-        for pat in (r'(?:Цена|Текуща цена|Специална цена)\s*:?\s*([\d\s\u00a0.,]+?)\s*(€|EUR|лв\.?|BGN)',):
-            z=re.search(pat,txt,re.I)
-            if z: current=eur(amount(z.group(1)),z.group(2));break
-    if current is None or current<0 or current>=pcd:return None
-    pct=round(100*(pcd-current)/pcd,2)
-    if pct<MIN_DIFF:return None
-    h=soup.select_one('h1')
-    title=(h.get_text(' ',strip=True) if h else (soup.title.get_text(' ',strip=True) if soup.title else url))
-    return {'name':title[:240],'url':url,'pcd_eur':pcd,'price_eur':current,'difference_eur':round(pcd-current,2),'difference_percent':pct}
+        match = re.search(
+            r"(?:Текуща цена|Специална цена|Цена)"
+            r"\s*:?\s*([\d\s\u00a0.,]+?)\s*(€|EUR|лв\.?|BGN)",
+            text,
+            re.I
+        )
+
+        if match:
+            current = eur(amount(match.group(1)), match.group(2))
+
+    if current is None or current < MIN_PRICE or current >= pcd:
+        return None
+
+    percentage = round(100 * (pcd - current) / pcd, 2)
+
+    if percentage < MIN_DIFF:
+        return None
+
+    heading = soup.select_one("h1")
+
+    name = (
+        heading.get_text(" ", strip=True)
+        if heading
+        else (
+            soup.title.get_text(" ", strip=True)
+            if soup.title else url
+        )
+    )
+
+    return {
+        "name": name[:240],
+        "url": url,
+        "pcd_eur": pcd,
+        "price_eur": current,
+        "difference_eur": round(pcd - current, 2),
+        "difference_percent": percentage
+    }
+
 
 def save():
-    state['updated_utc']=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
-    os.makedirs('docs',exist_ok=True)
-    with open(DATA,'w',encoding='utf8') as f:json.dump(state,f,ensure_ascii=False,indent=2)
-    with open('docs/results.csv','w',encoding='utf-8-sig',newline='') as f:
-        w=csv.writer(f);w.writerow(['Продукт','Линк','ПЦД €','Цена €','Разлика €','Разлика %'])
-        for p in state['items']:w.writerow([p['name'],p['url'],p['pcd_eur'],p['price_eur'],p['difference_eur'],p['difference_percent']])
+    state["updated_utc"] = datetime.datetime.now(
+        datetime.timezone.utc
+    ).isoformat(timespec="seconds")
+
+    os.makedirs("docs", exist_ok=True)
+
+    with open("docs/results.json", "w", encoding="utf-8") as fh:
+        json.dump(state, fh, ensure_ascii=False, indent=2)
+
+    with open(
+        "docs/results.csv",
+        "w",
+        encoding="utf-8-sig",
+        newline=""
+    ) as fh:
+        writer = csv.writer(fh)
+        writer.writerow([
+            "Продукт",
+            "Линк",
+            "ПЦД €",
+            "Цена €",
+            "Разлика €",
+            "Разлика %"
+        ])
+
+        for p in state["items"]:
+            writer.writerow([
+                p["name"],
+                p["url"],
+                p["pcd_eur"],
+                p["price_eur"],
+                p["difference_eur"],
+                p["difference_percent"]
+            ])
+
+    with open(
+        "docs/diagnostics.json",
+        "w",
+        encoding="utf-8"
+    ) as fh:
+        json.dump({
+            "status": state["status"],
+            "diagnostics": state["diagnostics"],
+            "errors": state["errors"]
+        }, fh, ensure_ascii=False, indent=2)
+
 
 def main():
     try:
-        robots_url=urllib.parse.urljoin(BASE,'robots.txt')
-        response=request(robots_url)
-        rules=urllib.robotparser.RobotFileParser(); rules.parse(response.text.splitlines())
-        if not rules.can_fetch(UA,BASE):
-            state['status']='blocked_by_robots';return
-        sitemaps=re.findall(r'^Sitemap:\s*(\S+)',response.text,re.I|re.M)
-        # Defaults are probes only if robots allows them; not evidence sitemap actually exists.
-        if not sitemaps:sitemaps=[urllib.parse.urljoin(BASE,'sitemap.xml')]
-        queue=deque(sitemaps); visited=set();product_urls=[];seen_urls=set();count=0
-        while queue and count<MAX_SITEMAPS and len(product_urls)<MAX_PRODUCTS*5:
-            sm=queue.popleft()
-            if sm in visited:continue
-            visited.add(sm);count+=1
-            if urllib.parse.urlparse(sm).hostname not in ('emag.bg','www.emag.bg'):continue
-            if not rules.can_fetch(UA,sm):continue
-            try:
-                resp=request(sm)
-                if len(resp.content)>15_000_000:continue
-                root=ET.fromstring(resp.content)
-            except PermissionError:raise
-            except Exception as e:
-                state['errors'].append(f'Sitemap {sm}: {str(e)[:110]}');continue
-            for loc in root.iter():
-                if loc.tag.split('}')[-1]!='loc' or not loc.text:continue
-                link=loc.text.strip(); host=urllib.parse.urlparse(link).hostname
-                if host not in ('emag.bg','www.emag.bg'):continue
-                if link.lower().endswith(('.xml','.xml.gz')):
-                    if link not in visited:queue.append(link)
-                elif '/pd/' in link and link not in seen_urls:
-                    product_urls.append(link);seen_urls.add(link)
-        state['discovered_urls']=len(product_urls)
-        if not product_urls:
-            state['status']='no_product_urls_found';return
-        old={p['url']:p for p in state['items']}
-        for url in product_urls[:MAX_PRODUCTS]:
-            if not rules.can_fetch(UA,url):continue
-            try:
-                resp=request(url)
-                item=extract(resp.text,url)
-                if item:old[url]=item
-                elif url in old:del old[url]
-                state['checked']+=1
-            except PermissionError:raise
-            except Exception as e:state['errors'].append(f'Продукт {url}: {str(e)[:95]}')
-        state['items']=sorted(old.values(),key=lambda p:p['difference_percent'],reverse=True)
-        state['status']='completed'
-    except PermissionError as e:
-        state['status']='access_blocked';state['errors'].append(str(e))
-    except requests.RequestException as e:
-        state['status']='network_error';state['errors'].append(str(e))
-    except Exception as e:
-        state['status']='error';state['errors'].append(str(e))
-    finally:save();print(json.dumps({k:v for k,v in state.items() if k!='items'},ensure_ascii=False))
+        accessible = []
 
-if __name__=='__main__':main()
+        for host in HOSTS:
+            rules, urls = robots_for(host)
+
+            if rules is not None:
+                accessible.append((rules, urls))
+
+        if not accessible:
+            state["status"] = "access_blocked"
+            return
+
+        queue = deque(
+            (url, rules)
+            for rules, urls in accessible
+            for url in urls
+        )
+
+        visited = set()
+        products = []
+        seen = set()
+
+        while (
+            queue
+            and len(visited) < MAX_SITEMAPS
+            and len(products) < MAX_PRODUCTS * 5
+        ):
+            url, rules = queue.popleft()
+
+            if url in visited:
+                continue
+
+            visited.add(url)
+
+            if urllib.parse.urlsplit(url).hostname not in ALLOWED_HOSTS:
+                continue
+
+            if not rules.can_fetch(UA, url):
+                record(url, None, "Blocked by robots.txt")
+                continue
+
+            try:
+                response = get(url)
+                record(
+                    url,
+                    response.status_code,
+                    "sitemap",
+                    response.url
+                )
+
+                if response.status_code in (401, 403, 429, 503, 511):
+                    state["errors"].append(
+                        f"Sitemap blocked: HTTP {response.status_code}"
+                    )
+                    continue
+
+                response.raise_for_status()
+
+                if len(response.content) > 15_000_000:
+                    continue
+
+                raw = response.content
+
+                if raw[:2] == b"\x1f\x8b":
+                    raw = gzip.decompress(raw)
+
+                root = ET.fromstring(raw)
+
+                for node in root.iter():
+                    if (
+                        node.tag.rsplit("}", 1)[-1] != "loc"
+                        or not node.text
+                    ):
+                        continue
+
+                    link = node.text.strip()
+
+                    if urllib.parse.urlsplit(link).hostname not in ALLOWED_HOSTS:
+                        continue
+
+                    if link.lower().endswith((".xml", ".xml.gz")):
+                        queue.append((link, rules))
+
+                    elif "/pd/" in link and link not in seen:
+                        seen.add(link)
+                        products.append((link, rules))
+
+            except (
+                requests.RequestException,
+                ValueError,
+                ET.ParseError,
+                OSError
+            ) as exc:
+                record(url, None, str(exc)[:200])
+
+        state["discovered_urls"] = len(products)
+
+        for url, rules in products[:MAX_PRODUCTS]:
+            if not rules.can_fetch(UA, url):
+                continue
+
+            try:
+                response = get(url)
+
+                if response.status_code in (401, 403, 429, 503, 511):
+                    state["errors"].append(
+                        f"Product access blocked: HTTP {response.status_code}"
+                    )
+                    state["status"] = "access_blocked"
+                    break
+
+                response.raise_for_status()
+
+                found = extract(response.text, url)
+
+                if found:
+                    state["items"].append(found)
+
+                state["checked"] += 1
+
+            except requests.RequestException as exc:
+                state["errors"].append(
+                    f"Product error: {str(exc)[:120]}"
+                )
+
+        if state["status"] == "starting":
+            state["status"] = (
+                "completed"
+                if products
+                else "no_product_urls_found"
+            )
+
+        state["items"].sort(
+            key=lambda p: p["difference_percent"],
+            reverse=True
+        )
+
+    except Exception as exc:
+        state["status"] = "error"
+        state["errors"].append(
+            type(exc).__name__ + ": " + str(exc)[:200]
+        )
+
+    finally:
+        save()
+
+        print(json.dumps(
+            {
+                k: v for k, v in state.items()
+                if k != "items"
+            },
+            ensure_ascii=False
+        ))
+
+
+if __name__ == "__main__":
+    main()
