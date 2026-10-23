@@ -1,0 +1,10 @@
+{
+  "status": "access_blocked",
+  "checked": 0,
+  "discovered_urls": 0,
+  "errors": [
+    "HTTP 511 за https://www.emag.bg/robots.txt"
+  ],
+  "updated_utc": "2026-10-23T10:38:18+00:00",
+  "items": []
+}
